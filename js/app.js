@@ -1,7 +1,7 @@
 // ===== 默认示例内容 =====
-const defaultContent = `# 简单的 Markdown 语法（速查）
+const defaultContent = `# Markdown 语法速查（完整版）
 
-这篇文章整理了常用 Markdown 语法，适合作为写作时的速查手册。
+本文整理标准 GFM Markdown 以及扩展自定义语法，适合作为写作速查手册。
 
 参考来源：https://note.motues.top/docs/Markdown/use
 
@@ -40,6 +40,14 @@ const defaultContent = `# 简单的 Markdown 语法（速查）
 ***粗斜体***
 
 ~~删除线~~
+
+++下划线++
+
+==彩虹文字==
+
+!!模糊/剧透文本!!
+
+{汉字}(hàn zì) 拼音注音
 
 ---
 
@@ -130,10 +138,74 @@ $$
 
 ---
 
-## 提示卡片
+## 脚注
 
-:::tip
-这是一个提示卡片。
+这是一段包含脚注的文字[^1]，脚注会在文末自动生成。
+
+[^1]: 这是脚注的内容，支持 **Markdown** 格式。
+
+---
+
+## 提示框 (Admonitions)
+
+:::note
+这是一个笔记提示框。
+:::
+
+:::tip{name="自定义标题"}
+这是一个带自定义标题的提示。
+:::
+
+:::important
+这是重要信息提示。
+:::
+
+:::warning
+这是警告信息。
+:::
+
+:::caution
+这是危险/注意事项。
+:::
+
+---
+
+## 引用卡片
+
+:::quote
+这是一段优美的引用。
+<right>—— 作者名</right>
+:::
+
+---
+
+## GitHub 仓库卡片
+
+::github{repo="facebook/react"}
+
+---
+
+## 音乐卡片
+
+::music{id="1404885291"}
+
+---
+
+## 图片说明
+
+![美丽的风景](https://picsum.photos/400/250 "这是一张示例图片")
+
+---
+
+## 公式推导
+
+$$
+E = mc^2
+$$
+
+:::derivation
+质能等价公式由爱因斯坦于 1905 年提出，是狭义相对论的重要推论。
+$E$ 表示能量，$m$ 表示质量，$c$ 表示光速。
 :::
 
 ---
@@ -344,14 +416,26 @@ function updatePreview() {
         const html = renderMarkdown(markdown);
         preview.innerHTML = html;
 
-        // 处理提示卡片
-        processTipCards();
-
         // 渲染 KaTeX 公式
         renderMath();
 
         // 代码高亮
         highlightCode();
+
+        // 添加代码复制按钮事件
+        bindCopyCodeButtons();
+
+        // 绑定模糊/剧透点击事件
+        bindSpoilerEvents();
+
+        // 绑定推导浮层事件
+        bindDerivationEvents();
+
+        // 加载 GitHub 卡片数据
+        loadGithubCardData();
+
+        // 加载音乐卡片数据
+        loadMusicCardData();
 
         // 为预览区建立逐字符选区映射
         rebuildPreviewSelectionModel(markdown);
@@ -695,28 +779,354 @@ function updateSelectionStatus(text) {
     }
 }
 
-// ===== 处理提示卡片 =====
-function processTipCards() {
+// ===== 自定义语法预处理 =====
+function preprocessCustomSyntax(markdown) {
+    // 保护代码块和代码内容，避免被后续处理干扰
+    const codeBlocks = [];
+    const codeSpans = [];
+
+    // 提取代码块 ```...```
+    markdown = markdown.replace(/```[\s\S]*?```/g, function(match) {
+        codeBlocks.push(match);
+        return `%%CODEBLOCK_${codeBlocks.length - 1}%%`;
+    });
+
+    // 提取行内代码 `...`
+    markdown = markdown.replace(/`[^`]+`/g, function(match) {
+        codeSpans.push(match);
+        return `%%CODESPAN_${codeSpans.length - 1}%%`;
+    });
+
+    // 1. 处理容器指令 :::note / :::tip / :::important / :::warning / :::caution / :::quote / :::derivation
+    markdown = markdown.replace(/:::(note|tip|important|warning|caution|quote|derivation)(?:\s*\{([^}]*)\})?\s*\n([\s\S]*?):::/g, function(match, type, attrs, content) {
+        const lowerType = type.toLowerCase();
+
+        if (lowerType === 'quote') {
+            return `\n<div class="quote-card">${content.trim()}</div>\n`;
+        }
+
+        if (lowerType === 'derivation') {
+            return `\n<div class="derivation-block" hidden>${content.trim()}</div>\n`;
+        }
+
+        // 处理 admonition 类型
+        const classMap = {
+            'note': 'note',
+            'tip': 'tip',
+            'important': 'important',
+            'warning': 'warning',
+            'caution': 'caution'
+        };
+
+        const admonitionClass = classMap[lowerType] || lowerType;
+        let title = '';
+
+        // 解析属性中的 name
+        if (attrs && attrs.includes('name=')) {
+            const nameMatch = attrs.match(/name="([^"]*)"/);
+            if (nameMatch) {
+                title = nameMatch[1];
+            }
+        }
+
+        const titleHtml = title
+            ? `<div class="admonition-title">${escapeHtml(title)}</div>`
+            : `<div class="admonition-title">${admonitionClass.charAt(0).toUpperCase() + admonitionClass.slice(1)}</div>`;
+
+        return `\n<div class="admonition ${admonitionClass}">${titleHtml}\n${content.trim()}</div>\n`;
+    });
+
+    // 2. 处理 GitHub 卡片 ::github{repo="..."}
+    markdown = markdown.replace(/::github\s*\{[^}]*repo="([^"]*)"[^}]*\}/g, function(match, repo) {
+        return generateGithubCardHtml(repo);
+    });
+
+    // 3. 处理音乐卡片 ::music{id="..."}
+    markdown = markdown.replace(/::music\s*\{[^}]*id="([^"]*)"[^}]*\}/g, function(match, songId) {
+        return generateMusicCardHtml(songId);
+    });
+
+    // 4. 处理 Ruby 注音 {汉字}(pinyin)
+    markdown = markdown.replace(/\{(.+?)\}\((.+?)\)/g, function(match, text, reading) {
+        let rubyHtml = '';
+        if (reading.includes('|')) {
+            const baseChars = Array.from(text);
+            const readings = reading.split('|');
+            const maxLength = Math.max(baseChars.length, readings.length);
+            for (let i = 0; i < maxLength; i++) {
+                const char = escapeHtml(baseChars[i] || '');
+                const rt = escapeHtml(readings[i] || '');
+                rubyHtml += `${char}<rt>${rt}</rt>`;
+            }
+        } else {
+            rubyHtml = `${escapeHtml(text)}<rt>${escapeHtml(reading)}</rt>`;
+        }
+        return `<ruby>${rubyHtml}</ruby>`;
+    });
+
+    // 5. 处理模糊/剧透 !!...!!
+    markdown = markdown.replace(/!!(.+?)!!/g, '<span class="spoiler">$1</span>');
+
+    // 6. 处理彩虹文字 ==...==
+    markdown = markdown.replace(/==(.+?)==/g, '<span class="rainbow-text">$1</span>');
+
+    // 7. 处理下划线 ++...++
+    markdown = markdown.replace(/\+\+(.+?)\+\+/g, '<span class="underline-text">$1</span>');
+
+    // 8. 处理图片说明 ![alt](url "title") -> figure
+    markdown = markdown.replace(/!\[([^\]]*)\]\(([^)\s]+)\s+"([^"]*)"\)/g, function(match, alt, url, title) {
+        return `\n<figure><img src="${url}" alt="${escapeHtml(alt)}"><figcaption>${escapeHtml(title)}</figcaption></figure>\n`;
+    });
+
+    // 恢复行内代码
+    markdown = markdown.replace(/%%CODESPAN_(\d+)%%/g, function(match, index) {
+        return codeSpans[parseInt(index)] || match;
+    });
+
+    // 恢复代码块
+    markdown = markdown.replace(/%%CODEBLOCK_(\d+)%%/g, function(match, index) {
+        return codeBlocks[parseInt(index)] || match;
+    });
+
+    return markdown;
+}
+
+// ===== 生成 GitHub 卡片 HTML =====
+function generateGithubCardHtml(repo) {
+    const cardUuid = 'GC' + Math.random().toString(36).slice(-6);
+    return `
+<div id="${cardUuid}-card" class="card-github fetch-waiting" data-repo="${escapeHtml(repo)}" target="_blank">
+    <div class="gc-titlebar">
+        <div class="gc-titlebar-left">
+            <div id="${cardUuid}-avatar" class="gc-avatar"></div>
+            <span class="gc-user">${escapeHtml(repo.split('/')[0])}</span>
+            <span class="gc-divider">/</span>
+            <span class="gc-repo">${escapeHtml(repo.split('/')[1] || '')}</span>
+        </div>
+    </div>
+    <div id="${cardUuid}-description" class="gc-description">Loading...</div>
+    <div class="gc-infobar">
+        <div id="${cardUuid}-stars" class="gc-stars">...</div>
+        <div id="${cardUuid}-forks" class="gc-forks">...</div>
+        <div id="${cardUuid}-language" class="gc-language">...</div>
+    </div>
+</div>`;
+}
+
+// ===== 生成音乐卡片 HTML =====
+function generateMusicCardHtml(songId) {
+    const cardUuid = 'MC' + Math.random().toString(36).slice(-6);
+    return `
+<a id="${cardUuid}-card" class="card-music fetch-waiting" data-song-id="${escapeHtml(songId)}" href="https://music.163.com/#/song?id=${escapeHtml(songId)}" target="_blank" rel="noopener noreferrer">
+    <div class="music-card-inner">
+        <div id="${cardUuid}-cover" class="music-cover"></div>
+        <div class="music-info">
+            <div id="${cardUuid}-title" class="music-title">Loading...</div>
+            <div id="${cardUuid}-artist" class="music-artist">Waiting...</div>
+        </div>
+    </div>
+</a>`;
+}
+
+// ===== 加载 GitHub 卡片数据 =====
+function loadGithubCardData() {
+    if (!preview) return;
+    const cards = preview.querySelectorAll('.card-github.fetch-waiting');
+    cards.forEach(function(card) {
+        const repo = card.dataset.repo;
+        if (!repo) return;
+        const cardUuid = card.id.replace('-card', '');
+
+        fetch(`https://api.github.com/repos/${repo}`, { referrerPolicy: 'no-referrer' })
+            .then(function(response) { return response.json(); })
+            .then(function(data) {
+                if (data.message === 'Not Found') throw new Error('Repo not found');
+
+                const descEl = document.getElementById(`${cardUuid}-description`);
+                const langEl = document.getElementById(`${cardUuid}-language`);
+                const starsEl = document.getElementById(`${cardUuid}-stars`);
+                const forksEl = document.getElementById(`${cardUuid}-forks`);
+                const avatarEl = document.getElementById(`${cardUuid}-avatar`);
+
+                if (descEl) descEl.textContent = (data.description || '').replace(/:[a-zA-Z0-9_]+:/g, '') || 'No description';
+                if (langEl) langEl.textContent = data.language || 'Unknown';
+
+                const fmt = Intl.NumberFormat('en-us', { notation: 'compact', maximumFractionDigits: 1 });
+                if (starsEl) starsEl.textContent = fmt.format(data.stargazers_count || 0);
+                if (forksEl) forksEl.textContent = fmt.format(data.forks || 0);
+                if (avatarEl && data.owner) {
+                    avatarEl.style.backgroundImage = 'url(' + data.owner.avatar_url + ')';
+                    avatarEl.style.backgroundColor = 'transparent';
+                }
+
+                card.classList.remove('fetch-waiting');
+                card.dataset.loaded = 'true';
+            })
+            .catch(function(err) {
+                card.classList.add('fetch-error');
+                console.warn('[GITHUB-CARD] Error loading ' + repo + ':', err);
+            });
+    });
+}
+
+// ===== 加载音乐卡片数据 =====
+function loadMusicCardData() {
+    if (!preview) return;
+    const cards = preview.querySelectorAll('.card-music.fetch-waiting');
+    cards.forEach(function(card) {
+        const songId = card.dataset.songId;
+        if (!songId) return;
+        const cardUuid = card.id.replace('-card', '');
+
+        fetch(`https://163api.qijieya.cn/song/detail?ids=${songId}`)
+            .then(function(response) { return response.json(); })
+            .then(function(data) {
+                if (data && data.songs && data.songs.length > 0) {
+                    const song = data.songs[0];
+
+                    const titleEl = document.getElementById(`${cardUuid}-title`);
+                    const artistEl = document.getElementById(`${cardUuid}-artist`);
+                    const coverEl = document.getElementById(`${cardUuid}-cover`);
+
+                    if (titleEl) titleEl.textContent = song.name || 'Unknown';
+                    if (artistEl) {
+                        const artistName = song.ar ? song.ar.map(function(a) { return a.name; }).join(', ') : 'Unknown Artist';
+                        artistEl.textContent = artistName;
+                    }
+                    if (coverEl && song.al && song.al.picUrl) {
+                        coverEl.style.backgroundImage = 'url(' + song.al.picUrl + ')';
+                        coverEl.style.backgroundColor = 'transparent';
+                    }
+
+                    card.classList.remove('fetch-waiting');
+                    card.dataset.loaded = 'true';
+                }
+            })
+            .catch(function(err) {
+                card.classList.add('fetch-error');
+                console.warn('[MUSIC-CARD] Error loading ' + songId + ':', err);
+            });
+    });
+}
+
+// ===== 代码复制按钮 =====
+function bindCopyCodeButtons() {
+    if (!preview) return;
+    const btns = preview.querySelectorAll('.copy-code-btn');
+    btns.forEach(function(btn) {
+        if (btn.dataset.bound === 'true') return;
+        btn.dataset.bound = 'true';
+        btn.addEventListener('click', function() {
+            const targetId = btn.dataset.target;
+            const codeEl = document.getElementById(targetId);
+            if (!codeEl) return;
+
+            const code = codeEl.textContent;
+            navigator.clipboard.writeText(code).then(function() {
+                btn.textContent = '已复制!';
+                btn.classList.add('is-copied');
+                setTimeout(function() {
+                    btn.textContent = '复制';
+                    btn.classList.remove('is-copied');
+                }, 2000);
+            }).catch(function() {
+                // 降级方案
+                const textarea = document.createElement('textarea');
+                textarea.value = code;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                btn.textContent = '已复制!';
+                btn.classList.add('is-copied');
+                setTimeout(function() {
+                    btn.textContent = '复制';
+                    btn.classList.remove('is-copied');
+                }, 2000);
+            });
+        });
+    });
+}
+
+// ===== 模糊/剧透点击事件 =====
+function bindSpoilerEvents() {
+    if (!preview) return;
+    const spoilers = preview.querySelectorAll('.spoiler:not([data-bound])');
+    spoilers.forEach(function(el) {
+        el.dataset.bound = 'true';
+        el.addEventListener('click', function() {
+            el.classList.toggle('revealed');
+        });
+    });
+}
+
+// ===== 公式推导浮层 =====
+function bindDerivationEvents() {
     if (!preview) return;
 
-    // 查找所有段落，检查是否包含 :::tip 和 :::
-    const paragraphs = preview.querySelectorAll('p');
-    paragraphs.forEach(function(p) {
-        const html = p.innerHTML;
-        // 检查是否是提示卡片格式
-        if (html.includes(':::tip')) {
-            // 提取提示内容
-            const content = html.replace(':::tip', '').replace(':::', '').trim();
-            if (content) {
-                // 创建提示卡片元素
-                const tipDiv = document.createElement('div');
-                tipDiv.className = 'tip';
-                tipDiv.innerHTML = content;
-                p.replaceWith(tipDiv);
-            } else {
-                // 空提示卡片，移除
-                p.remove();
+    // 查找所有 derivation-block
+    const derivBlocks = preview.querySelectorAll('.derivation-block');
+    derivBlocks.forEach(function(block) {
+        if (block.dataset.bound === 'true') return;
+        block.dataset.bound = 'true';
+
+        // 找到前一个 katex 元素
+        let prevEl = block.previousElementSibling;
+        while (prevEl) {
+            if (prevEl.classList && (prevEl.classList.contains('katex-display') || prevEl.classList.contains('katex'))) {
+                prevEl.classList.add('derivable');
+                block.dataset.target = 'bound';
+
+                // 创建浮层
+                let popup = null;
+
+                function showPopup() {
+                    if (!popup) {
+                        popup = document.createElement('div');
+                        popup.className = 'derivation-popup';
+                        popup.innerHTML = '<div class="derivation-popup-title">📐 公式推导</div><div>' + block.innerHTML + '</div>';
+                        document.body.appendChild(popup);
+
+                        // 渲染浮层内的公式
+                        if (typeof renderMathInElement !== 'undefined') {
+                            renderMathInElement(popup, {
+                                delimiters: [
+                                    { left: '$$', right: '$$', display: true },
+                                    { left: '$', right: '$', display: false }
+                                ],
+                                throwOnError: false
+                            });
+                        }
+                    }
+
+                    const rect = prevEl.getBoundingClientRect();
+                    popup.style.left = rect.left + 'px';
+                    popup.style.top = (rect.bottom + 8) + 'px';
+                    popup.style.maxWidth = Math.min(400, window.innerWidth - 32) + 'px';
+                    popup.classList.add('is-visible');
+                }
+
+                function hidePopup() {
+                    if (popup) {
+                        popup.classList.remove('is-visible');
+                    }
+                }
+
+                prevEl.addEventListener('mouseenter', showPopup);
+                prevEl.addEventListener('mouseleave', hidePopup);
+                prevEl.addEventListener('click', function() {
+                    if (popup && popup.classList.contains('is-visible')) {
+                        hidePopup();
+                    } else {
+                        showPopup();
+                    }
+                });
+
+                // 移动端触摸支持
+                prevEl.style.cursor = 'help';
+                break;
             }
+            prevEl = prevEl.previousElementSibling;
         }
     });
 }
@@ -726,6 +1136,9 @@ function renderMarkdown(markdown) {
     if (!markdown) return '';
 
     try {
+        // 预处理自定义语法（在 marked 解析之前）
+        let processedMd = preprocessCustomSyntax(markdown);
+
         // 配置 marked
         marked.setOptions({
             breaks: true,
@@ -734,17 +1147,18 @@ function renderMarkdown(markdown) {
             mangle: false,
             sanitize: false,
             smartLists: true,
-            smartypants: true,
+            smartypants: false,
             xhtml: false
         });
 
         // 自定义渲染器
         const renderer = new marked.Renderer();
 
-        // 自定义代码块渲染
+        // 自定义代码块渲染（添加复制按钮）
         renderer.code = function(code, language) {
             const validLanguage = language && hljs.getLanguage(language) ? language : 'plaintext';
-            return `<pre><code class="hljs language-${validLanguage}">${escapeHtml(code)}</code></pre>`;
+            const codeId = 'code-' + Math.random().toString(36).slice(-8);
+            return `<pre><button class="copy-code-btn" data-target="${codeId}" title="复制代码">复制</button><code id="${codeId}" class="hljs language-${validLanguage}">${escapeHtml(code)}</code></pre>`;
         };
 
         // 自定义任务列表渲染
@@ -755,28 +1169,39 @@ function renderMarkdown(markdown) {
             return `<li>${text}</li>`;
         };
 
+        // 自定义图片渲染（支持 figure 包裹）
+        renderer.image = function(href, title, text) {
+            if (title) {
+                return `<figure><img src="${href}" alt="${escapeHtml(text)}" title="${escapeHtml(title)}"><figcaption>${escapeHtml(title)}</figcaption></figure>`;
+            }
+            return `<img src="${href}" alt="${escapeHtml(text)}" title="${title || ''}">`;
+        };
+
+        // 自定义链接渲染（添加 target="_blank"）
+        renderer.link = function(href, title, text) {
+            const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+            return `<a href="${escapeHtml(href)}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+        };
+
         marked.use({ renderer });
 
         // 渲染 Markdown
-        let html = marked.parse(markdown);
+        let html = marked.parse(processedMd);
 
-        // XSS 防护 - 允许 div 和 tip 类
+        // XSS 防护
         if (typeof DOMPurify !== 'undefined') {
             html = DOMPurify.sanitize(html, {
-                ALLOWED_TAGS: [
-                    'p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-                    'strong', 'em', 'del', 'a', 'img', 'blockquote',
-                    'ul', 'ol', 'li', 'code', 'pre', 'table', 'thead',
-                    'tbody', 'tr', 'th', 'td', 'div', 'span', 'input'
+                ADD_TAGS: [
+                    'div', 'span', 'ruby', 'rt', 'figure', 'figcaption',
+                    'a[data-repo]', 'a[data-song-id]'
                 ],
-                ALLOWED_ATTR: [
-                    'href', 'src', 'alt', 'title', 'class', 'id',
-                    'type', 'checked', 'disabled', 'language'
+                ADD_ATTR: [
+                    'class', 'id', 'hidden', 'aria-hidden', 'data-repo',
+                    'data-song-id', 'data-loaded', 'data-target', 'data-footnote-id',
+                    'data-footnote-backref', 'ref'
                 ],
-                ALLOWED_CLASSES: {
-                    'div': ['tip', 'katex-display'],
-                    '*': ['hljs', 'language-*', 'task-list-item']
-                }
+                ALLOW_DATA_ATTR: true,
+                ADD_URI_SAFE_ATTR: ['class']
             });
         }
 
@@ -1017,6 +1442,72 @@ function handleToolbarAction(action) {
             cursorOffset = 5;
             selectStart = start + replacement.length;
             selectEnd = selectStart;
+            break;
+        case 'underline':
+            replacement = '++' + (selectedText || '下划线文本') + '++';
+            cursorOffset = 2;
+            selectStart = start + cursorOffset;
+            selectEnd = selectStart + (selectedText ? selectedText.length : 5);
+            break;
+        case 'spoiler':
+            replacement = '!!' + (selectedText || '模糊文本') + '!!';
+            cursorOffset = 2;
+            selectStart = start + cursorOffset;
+            selectEnd = selectStart + (selectedText ? selectedText.length : 4);
+            break;
+        case 'rainbow':
+            replacement = '==' + (selectedText || '彩虹文字') + '==';
+            cursorOffset = 2;
+            selectStart = start + cursorOffset;
+            selectEnd = selectStart + (selectedText ? selectedText.length : 4);
+            break;
+        case 'ruby':
+            replacement = '{汉字}(hàn zì)';
+            cursorOffset = 1;
+            selectStart = start + cursorOffset;
+            selectEnd = start + 3;
+            break;
+        case 'footnote':
+            replacement = '[^1]';
+            cursorOffset = 3;
+            selectStart = start + replacement.length;
+            selectEnd = selectStart;
+            break;
+        case 'quote-card':
+            replacement = ':::quote\n引用内容\n<right>—— 作者</right>\n:::';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
+            break;
+        case 'admonition':
+            replacement = ':::tip\n提示内容\n:::';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
+            break;
+        case 'derivation':
+            replacement = ':::derivation\n推导过程\n:::';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
+            break;
+        case 'github-card':
+            replacement = '::github{repo="用户名/仓库名"}';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
+            break;
+        case 'music-card':
+            replacement = '::music{id="歌曲ID"}';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
+            break;
+        case 'figure':
+            replacement = '![图片描述](图片URL "图片说明")';
+            cursorOffset = 0;
+            selectStart = start;
+            selectEnd = start + replacement.length;
             break;
         default:
             console.warn('未知的操作:', action);
