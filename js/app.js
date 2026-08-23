@@ -218,16 +218,22 @@ $E$ 表示能量，$m$ 表示质量，$c$ 表示光速。
 `;
 
 // ===== DOM 元素 =====
-let editor, preview, previewWrapper, wordCount, themeToggle, themeIcon, loadExampleBtn, exportMdBtn, clearBtn, hljsTheme, selectionStatus;
+let editor, preview, previewWrapper, wordCount, themeToggle, themeIcon, loadExampleBtn, exportMdBtn, clearBtn, hljsThemeLight, hljsThemeDark, selectionStatus;
 
 // ===== 状态 =====
 let currentTheme = 'light';
 let autoSaveTimer = null;
 let isInitialized = false;
-let previewCharElements = [];
+let previewSegments = [];
+let previewSegmentByNode = new WeakMap();
+let previewTextLength = 0;
 let sourceToPreviewBoundary = [];
 let previewToSourceBoundary = [];
 let isSelectionSyncing = false;
+
+// 双向高亮基于 CSS Custom Highlight API（Chrome 105+/Safari 17.2+/Firefox 140+），
+// 不支持的浏览器自动降级为仅同步编辑区选区
+const supportsHighlightAPI = typeof window.Highlight !== 'undefined' && !!(window.CSS && window.CSS.highlights);
 
 // ===== 检查依赖是否加载 =====
 function checkDependencies() {
@@ -255,8 +261,7 @@ function init() {
 
     // 检查依赖
     if (!checkDependencies()) {
-        console.error('依赖加载失败，请检查网络连接');
-        alert('部分依赖加载失败，请检查网络连接后刷新页面');
+        showFatalError('部分页面依赖加载失败', '无法从 CDN 加载渲染所需的库，请检查网络连接后重试。');
         return;
     }
 
@@ -270,7 +275,8 @@ function init() {
     loadExampleBtn = document.getElementById('load-example');
     exportMdBtn = document.getElementById('export-md');
     clearBtn = document.getElementById('clear');
-    hljsTheme = document.getElementById('hljs-theme');
+    hljsThemeLight = document.getElementById('hljs-theme-light');
+    hljsThemeDark = document.getElementById('hljs-theme-dark');
     selectionStatus = document.getElementById('selection-status');
 
     // 检查 DOM 元素
@@ -309,28 +315,37 @@ function init() {
     // 绑定事件
     bindEvents();
 
-    // 锁定 body 滚动，只允许编辑区和预览区滚动
-    lockBodyScroll();
-
     isInitialized = true;
     console.log('初始化完成');
 }
 
-// ===== 锁定 body 滚动 =====
-function lockBodyScroll() {
-    document.body.style.overflow = 'hidden';
-    document.body.style.height = '100vh';
-    document.documentElement.style.overflow = 'hidden';
-    document.documentElement.style.height = '100%';
+// ===== 依赖加载失败的整页提示 =====
+function showFatalError(title, message) {
+    console.error(title, message);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'fatal-error-overlay';
+    overlay.innerHTML =
+        '<div class="fatal-error-box">' +
+        '<div class="fatal-error-title">⚠ ' + escapeHtml(title) + '</div>' +
+        '<div class="fatal-error-message">' + escapeHtml(message) + '</div>' +
+        '<button class="fatal-error-retry" type="button">重新加载</button>' +
+        '</div>';
+
+    overlay.querySelector('.fatal-error-retry').addEventListener('click', function() {
+        location.reload();
+    });
+
+    document.body.appendChild(overlay);
 }
 
 // ===== 事件绑定 =====
 function bindEvents() {
     console.log('绑定事件...');
 
-    // 编辑器输入事件（使用防抖）
+    // 编辑器输入事件：预览渲染走防抖，字数统计与自动保存即时执行
     editor.addEventListener('input', function() {
-        updatePreview();
+        schedulePreviewUpdate();
         updateWordCount();
         scheduleAutoSave();
     });
@@ -407,6 +422,20 @@ function bindEvents() {
     console.log('事件绑定完成');
 }
 
+// ===== 预览渲染防抖 =====
+let previewRenderTimer = null;
+const PREVIEW_RENDER_DELAY = 120;
+
+function schedulePreviewUpdate() {
+    if (previewRenderTimer) {
+        clearTimeout(previewRenderTimer);
+    }
+    previewRenderTimer = setTimeout(function() {
+        previewRenderTimer = null;
+        updatePreview();
+    }, PREVIEW_RENDER_DELAY);
+}
+
 // ===== 更新预览 =====
 function updatePreview() {
     if (!editor || !preview) return;
@@ -437,7 +466,7 @@ function updatePreview() {
         // 加载音乐卡片数据
         loadMusicCardData();
 
-        // 为预览区建立逐字符选区映射
+        // 为预览区建立文本分段与源码的索引映射
         rebuildPreviewSelectionModel(markdown);
         syncSelectionFromEditor();
     } catch (error) {
@@ -446,72 +475,144 @@ function updatePreview() {
 }
 
 // ===== 预览选区模型 =====
+// 不再把每个字符包成 span，而是维护"文本节点 -> 扁平索引"的分段表，
+// 高亮用 CSS Custom Highlight API 的 Range 完成，DOM 规模与预览内容解耦
 function rebuildPreviewSelectionModel(markdown) {
-    previewCharElements = [];
+    previewSegments = [];
+    previewSegmentByNode = new WeakMap();
+    previewTextLength = 0;
     sourceToPreviewBoundary = [];
     previewToSourceBoundary = [];
 
     if (!preview) return;
 
-    wrapPreviewTextNodes(preview);
+    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+            return isTrackableTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+    });
 
-    const previewText = preview.textContent || '';
+    const pieces = [];
+    let currentNode = walker.nextNode();
+
+    while (currentNode) {
+        const segment = { node: currentNode, start: previewTextLength };
+        previewSegments.push(segment);
+        previewSegmentByNode.set(currentNode, segment);
+        pieces.push(currentNode.nodeValue);
+        previewTextLength += currentNode.nodeValue.length;
+        currentNode = walker.nextNode();
+    }
+
+    const previewText = pieces.join('');
     const alignment = buildSelectionAlignment(markdown, previewText);
     sourceToPreviewBoundary = alignment.sourceToPreviewBoundary;
     previewToSourceBoundary = alignment.previewToSourceBoundary;
 }
 
-function wrapPreviewTextNodes(root) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-        acceptNode: function(node) {
-            if (!node.nodeValue || !node.nodeValue.length) {
-                return NodeFilter.FILTER_REJECT;
-            }
+function isTrackableTextNode(node) {
+    if (!node.nodeValue || !node.nodeValue.length) return false;
 
-            const parent = node.parentElement;
-            if (!parent) {
-                return NodeFilter.FILTER_REJECT;
-            }
+    const parent = node.parentElement;
+    if (!parent) return false;
 
-            if (parent.closest('script, style, textarea')) {
-                return NodeFilter.FILTER_REJECT;
-            }
+    if (parent.closest('script, style, textarea')) return false;
 
-            if (parent.classList && parent.classList.contains('preview-char')) {
-                return NodeFilter.FILTER_REJECT;
-            }
+    // KaTeX 的隐藏 MathML 源码和带 hidden 属性的推导块不可见也不可选，
+    // 计入映射会让公式之后的所有索引错位
+    if (parent.closest('.katex-mathml')) return false;
+    if (parent.closest('[hidden]')) return false;
 
-            return NodeFilter.FILTER_ACCEPT;
-        }
-    });
+    return true;
+}
 
-    const textNodes = [];
-    let currentNode = walker.nextNode();
+// 扁平预览索引 -> { 文本节点, 节点内偏移 }
+function getPreviewPosition(index) {
+    if (!previewSegments.length) return null;
 
-    while (currentNode) {
-        textNodes.push(currentNode);
-        currentNode = walker.nextNode();
+    if (index <= 0) {
+        return { node: previewSegments[0].node, offset: 0 };
     }
 
-    let previewIndex = 0;
+    if (index >= previewTextLength) {
+        const last = previewSegments[previewSegments.length - 1];
+        return { node: last.node, offset: last.node.nodeValue.length };
+    }
 
-    textNodes.forEach(function(textNode) {
-        const fragment = document.createDocumentFragment();
-        const text = textNode.nodeValue;
+    let lo = 0;
+    let hi = previewSegments.length - 1;
 
-        for (let i = 0; i < text.length; i += 1) {
-            const char = text[i];
-            const span = document.createElement('span');
-            span.className = 'preview-char';
-            span.dataset.previewIndex = String(previewIndex);
-            span.textContent = char;
-            fragment.appendChild(span);
-            previewCharElements.push(span);
-            previewIndex += 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (previewSegments[mid].start <= index) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
+    }
 
-        textNode.parentNode.replaceChild(fragment, textNode);
+    const segment = previewSegments[lo];
+    return { node: segment.node, offset: index - segment.start };
+}
+
+function firstTrackedSegmentInSubtree(root) {
+    const node = firstTrackableTextNodeInSubtree(root);
+    return node ? (previewSegmentByNode.get(node) || null) : null;
+}
+
+function lastTrackedSegmentEndInSubtree(root) {
+    const node = lastTrackableTextNodeInSubtree(root);
+    if (!node) return null;
+    const segment = previewSegmentByNode.get(node);
+    return segment ? segment.start + node.nodeValue.length : null;
+}
+
+function firstTrackableTextNodeInSubtree(root) {
+    if (!root) return null;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+            return isTrackableTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
     });
+    return walker.nextNode();
+}
+
+function lastTrackableTextNodeInSubtree(root) {
+    if (!root) return null;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+            return isTrackableTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+    });
+    let last = null;
+    let current = walker.nextNode();
+    while (current) {
+        last = current;
+        current = walker.nextNode();
+    }
+    return last;
+}
+
+// 在有序分段表中二分查找 node 之后的第一个分段（用于未跟踪节点的就近映射）
+function segmentInsertionIndex(node) {
+    let lo = 0;
+    let hi = previewSegments.length;
+
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (node.compareDocumentPosition(previewSegments[mid].node) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    return lo;
+}
+
+function segmentEnd(index) {
+    const segment = previewSegments[index];
+    return segment ? segment.start + segment.node.nodeValue.length : previewTextLength;
 }
 
 function buildSelectionAlignment(sourceText, previewText) {
@@ -636,8 +737,8 @@ function syncSelectionFromPreview() {
         return;
     }
 
-    const previewStart = getPreviewBoundaryIndex(range.startContainer, range.startOffset);
-    const previewEnd = getPreviewBoundaryIndex(range.endContainer, range.endOffset);
+    const previewStart = getPreviewBoundaryIndex(range.startContainer, range.startOffset, false);
+    const previewEnd = getPreviewBoundaryIndex(range.endContainer, range.endOffset, true);
     const normalizedStart = Math.max(0, Math.min(previewStart, previewEnd));
     const normalizedEnd = Math.max(normalizedStart, Math.max(previewStart, previewEnd));
     const sourceStart = previewToSourceBoundary[normalizedStart] || 0;
@@ -652,70 +753,48 @@ function syncSelectionFromPreview() {
     isSelectionSyncing = false;
 }
 
-function getPreviewBoundaryIndex(container, offset) {
+// 预览 DOM 位置（节点 + 偏移）-> 扁平预览索引
+function getPreviewBoundaryIndex(container, offset, isEnd) {
+    if (!previewSegments.length) return 0;
+
     if (container.nodeType === Node.TEXT_NODE) {
-        const parent = container.parentElement;
-        if (parent && parent.classList.contains('preview-char')) {
-            const index = Number(parent.dataset.previewIndex || 0);
-            return index + Math.min(offset, 1);
+        if (preview.contains(container)) {
+            const segment = previewSegmentByNode.get(container);
+            if (segment) {
+                return segment.start + Math.min(offset, container.nodeValue.length);
+            }
         }
+        // 选区落在未跟踪的文本里（如隐藏区域）：就近取前后分段边界
+        const insertion = segmentInsertionIndex(container);
+        if (isEnd) {
+            return insertion > 0 ? segmentEnd(insertion - 1) : 0;
+        }
+        return insertion < previewSegments.length ? previewSegments[insertion].start : previewTextLength;
     }
 
     if (container.nodeType === Node.ELEMENT_NODE) {
-        const element = container;
+        const nextChild = container.childNodes[offset] || null;
+        const prevChild = offset > 0 ? container.childNodes[offset - 1] : null;
 
-        if (element.classList.contains('preview-char')) {
-            const index = Number(element.dataset.previewIndex || 0);
-            return index + Math.min(offset, 1);
+        if (nextChild) {
+            const segment = firstTrackedSegmentInSubtree(nextChild);
+            if (segment) return segment.start;
         }
 
-        const childAtOffset = element.childNodes[offset] || null;
-        const firstChar = childAtOffset ? findBoundaryChar(childAtOffset, true) : null;
-        if (firstChar) {
-            return Number(firstChar.dataset.previewIndex || 0);
+        if (prevChild) {
+            const end = lastTrackedSegmentEndInSubtree(prevChild);
+            if (end !== null) return end;
         }
 
-        const previousChild = element.childNodes[offset - 1] || null;
-        const lastChar = previousChild ? findBoundaryChar(previousChild, false) : null;
-        if (lastChar) {
-            return Number(lastChar.dataset.previewIndex || 0) + 1;
+        const anchor = nextChild || prevChild || container;
+        const insertion = segmentInsertionIndex(anchor);
+        if (isEnd) {
+            return insertion > 0 ? segmentEnd(insertion - 1) : 0;
         }
+        return insertion < previewSegments.length ? previewSegments[insertion].start : previewTextLength;
     }
 
-    return previewCharElements.length;
-}
-
-function findBoundaryChar(node, forward) {
-    if (!node) return null;
-
-    if (node.nodeType === Node.ELEMENT_NODE) {
-        const element = node;
-        if (element.classList.contains('preview-char')) {
-            return element;
-        }
-    }
-
-    const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, {
-        acceptNode: function(candidate) {
-            return candidate.classList && candidate.classList.contains('preview-char')
-                ? NodeFilter.FILTER_ACCEPT
-                : NodeFilter.FILTER_SKIP;
-        }
-    });
-
-    return forward ? walker.nextNode() : getLastWalkerNode(walker);
-}
-
-function getLastWalkerNode(walker) {
-    let lastNode = null;
-    let currentNode = walker.nextNode();
-
-    while (currentNode) {
-        lastNode = currentNode;
-        currentNode = walker.nextNode();
-    }
-
-    return lastNode;
+    return isEnd ? previewTextLength : 0;
 }
 
 function highlightPreviewSelection(sourceStart, sourceEnd) {
@@ -742,30 +821,49 @@ function highlightPreviewSelection(sourceStart, sourceEnd) {
 function highlightPreviewRange(start, end) {
     clearPreviewHighlights();
 
-    for (let i = start; i < end; i += 1) {
-        const element = previewCharElements[i];
-        if (element) {
-            element.classList.add('is-highlighted');
-        }
-    }
-
-    if (previewWrapper && previewCharElements[start]) {
-        previewCharElements[start].scrollIntoView({
-            block: 'nearest',
-            inline: 'nearest'
-        });
-    }
-
     const previewPane = preview ? preview.closest('.preview-pane') : null;
     if (previewPane) {
         previewPane.classList.add('is-selection-active');
     }
+
+    if (!supportsHighlightAPI || start === end || !previewSegments.length) return;
+
+    const startPos = getPreviewPosition(start);
+    const endPos = getPreviewPosition(end);
+    if (!startPos || !endPos) return;
+
+    try {
+        const range = document.createRange();
+        range.setStart(startPos.node, startPos.offset);
+        range.setEnd(endPos.node, endPos.offset);
+
+        CSS.highlights.set('md-selection-highlight', new Highlight(range));
+
+        scrollPreviewToReveal(range);
+    } catch (error) {
+        console.warn('预览高亮失败:', error);
+    }
+}
+
+function scrollPreviewToReveal(range) {
+    if (!previewWrapper) return;
+
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.height && !rect.width)) return;
+
+    const wrapperRect = previewWrapper.getBoundingClientRect();
+
+    if (rect.top < wrapperRect.top) {
+        previewWrapper.scrollTop += rect.top - wrapperRect.top - 16;
+    } else if (rect.bottom > wrapperRect.bottom) {
+        previewWrapper.scrollTop += rect.bottom - wrapperRect.bottom + 16;
+    }
 }
 
 function clearPreviewHighlights() {
-    previewCharElements.forEach(function(element) {
-        element.classList.remove('is-highlighted');
-    });
+    if (supportsHighlightAPI) {
+        CSS.highlights.delete('md-selection-highlight');
+    }
 
     const previewPane = preview ? preview.closest('.preview-pane') : null;
     if (previewPane) {
@@ -802,7 +900,11 @@ function preprocessCustomSyntax(markdown) {
         const lowerType = type.toLowerCase();
 
         if (lowerType === 'quote') {
-            return `\n<div class="quote-card">${content.trim()}</div>\n`;
+            // <right> 不是标准标签会被 DOMPurify 剥离，转成语义 span
+            const quoteHtml = content.trim().replace(/<right>([\s\S]*?)<\/right>/gi, function(m, inner) {
+                return '<span class="quote-author">' + inner.trim() + '</span>';
+            });
+            return `\n<div class="quote-card">${quoteHtml}</div>\n`;
         }
 
         if (lowerType === 'derivation') {
@@ -835,6 +937,45 @@ function preprocessCustomSyntax(markdown) {
 
         return `\n<div class="admonition ${admonitionClass}">${titleHtml}\n${content.trim()}</div>\n`;
     });
+
+    // 1.5 处理 GFM 脚注 [^label]（marked 核心不支持脚注，这里自行预处理）
+    // 定义 = 定义行 + 后续缩进续行；遇到空行或下一条定义即结束
+    const footnoteDefs = new Map();
+    markdown = markdown.replace(/^\[\^([^\]]+)\]:[ \t]*(.*(?:\n(?!\n)(?!\[\^[^\]]+\]:).*)*)/gm, function(match, label, content) {
+        footnoteDefs.set(label.trim(), content.trim());
+        return '';
+    });
+
+    if (footnoteDefs.size > 0) {
+        const footnoteOrder = new Map();
+        let footnoteCount = 0;
+
+        markdown = markdown.replace(/\[\^([^\]\s]+)\](?!:)/g, function(match, label) {
+            const key = label.trim();
+            if (!footnoteDefs.has(key)) return match;
+            if (!footnoteOrder.has(key)) {
+                footnoteCount += 1;
+                footnoteOrder.set(key, footnoteCount);
+            }
+            const num = footnoteOrder.get(key);
+            return `<sup class="footnote-ref" id="fnref-${num}"><a href="#fn-${num}">${num}</a></sup>`;
+        });
+
+        if (footnoteCount > 0) {
+            let items = '';
+            footnoteOrder.forEach(function(num, key) {
+                let rendered = escapeHtml(footnoteDefs.get(key));
+                try {
+                    // 脚注内容支持行内 Markdown（粗体、斜体等）
+                    rendered = marked.parseInline(footnoteDefs.get(key));
+                } catch (e) {
+                    // 解析失败时保留上面的转义文本
+                }
+                items += `<li id="fn-${num}">${rendered}<a href="#fnref-${num}" class="footnote-backref" aria-label="跳回正文">↩</a></li>\n`;
+            });
+            markdown += `\n<section class="footnotes">\n<ol>\n${items}</ol>\n</section>\n`;
+        }
+    }
 
     // 2. 处理 GitHub 卡片 ::github{repo="..."}
     markdown = markdown.replace(/::github\s*\{[^}]*repo="([^"]*)"[^}]*\}/g, function(match, repo) {
@@ -928,6 +1069,58 @@ function generateMusicCardHtml(songId) {
 </a>`;
 }
 
+// ===== 带缓存与超时的 JSON 请求 =====
+const apiCache = new Map();          // url -> 成功响应（永久缓存）
+const apiFailureTime = new Map();    // url -> 上次失败时间戳，30 秒内不重试
+const FETCH_TIMEOUT_MS = 8000;
+const FETCH_RETRY_INTERVAL_MS = 30000;
+const FETCH_THROTTLED = 'FETCH_THROTTLED';
+
+function fetchJsonCached(url) {
+    if (apiCache.has(url)) {
+        return Promise.resolve(apiCache.get(url));
+    }
+
+    const failedAt = apiFailureTime.get(url);
+    if (failedAt && Date.now() - failedAt < FETCH_RETRY_INTERVAL_MS) {
+        return Promise.reject(new Error(FETCH_THROTTLED));
+    }
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = setTimeout(function() {
+        if (controller) controller.abort();
+    }, FETCH_TIMEOUT_MS);
+
+    const options = controller
+        ? { referrerPolicy: 'no-referrer', signal: controller.signal }
+        : { referrerPolicy: 'no-referrer' };
+
+    return fetch(url, options)
+        .then(function(response) {
+            if (!response.ok) {
+                const error = new Error('HTTP ' + response.status);
+                error.statusCode = response.status;
+                throw error;
+            }
+            return response.json();
+        })
+        .then(function(data) {
+            clearTimeout(timer);
+            apiFailureTime.delete(url);
+            apiCache.set(url, data);
+            return data;
+        })
+        .catch(function(error) {
+            clearTimeout(timer);
+            apiFailureTime.set(url, Date.now());
+            throw error;
+        });
+}
+
+function isFetchTransientError(err) {
+    return err && (err.name === 'AbortError' || err.message === FETCH_THROTTLED);
+}
+
 // ===== 加载 GitHub 卡片数据 =====
 function loadGithubCardData() {
     if (!preview) return;
@@ -936,13 +1129,14 @@ function loadGithubCardData() {
         const repo = card.dataset.repo;
         if (!repo) return;
         const cardUuid = card.id.replace('-card', '');
+        const descEl = document.getElementById(`${cardUuid}-description`);
 
-        fetch(`https://api.github.com/repos/${repo}`, { referrerPolicy: 'no-referrer' })
-            .then(function(response) { return response.json(); })
+        const apiPath = repo.split('/').map(function(part) { return encodeURIComponent(part); }).join('/');
+        fetchJsonCached(`https://api.github.com/repos/${apiPath}`)
             .then(function(data) {
-                if (data.message === 'Not Found') throw new Error('Repo not found');
+                // 404 / 403 限流等都会带 message 字段，统一走错误分支，避免渲染出假的 0 star 数据
+                if (!data || data.message) throw new Error((data && data.message) || 'Repo not found');
 
-                const descEl = document.getElementById(`${cardUuid}-description`);
                 const langEl = document.getElementById(`${cardUuid}-language`);
                 const starsEl = document.getElementById(`${cardUuid}-stars`);
                 const forksEl = document.getElementById(`${cardUuid}-forks`);
@@ -963,7 +1157,13 @@ function loadGithubCardData() {
                 card.dataset.loaded = 'true';
             })
             .catch(function(err) {
+                card.classList.remove('fetch-waiting');
                 card.classList.add('fetch-error');
+                if (descEl) {
+                    descEl.textContent = err.statusCode === 403 || /rate/i.test(err.message || '')
+                        ? '加载失败：GitHub API 请求已达限额，请稍后再试'
+                        : (isFetchTransientError(err) ? '网络请求失败，请稍后重试' : '仓库信息加载失败');
+                }
                 console.warn('[GITHUB-CARD] Error loading ' + repo + ':', err);
             });
     });
@@ -978,33 +1178,44 @@ function loadMusicCardData() {
         if (!songId) return;
         const cardUuid = card.id.replace('-card', '');
 
-        fetch(`https://163api.qijieya.cn/song/detail?ids=${songId}`)
-            .then(function(response) { return response.json(); })
+        const fail = function(message, err) {
+            card.classList.remove('fetch-waiting');
+            card.classList.add('fetch-error');
+            const titleEl = document.getElementById(`${cardUuid}-title`);
+            if (titleEl) titleEl.textContent = message;
+            if (err) console.warn('[MUSIC-CARD] Error loading ' + songId + ':', err);
+        };
+
+        // 歌曲 ID 只允许数字，避免拼接出意外请求
+        if (!/^\d+$/.test(songId)) {
+            fail('歌曲 ID 无效');
+            return;
+        }
+
+        fetchJsonCached(`https://163api.qijieya.cn/song/detail?ids=${encodeURIComponent(songId)}`)
             .then(function(data) {
-                if (data && data.songs && data.songs.length > 0) {
-                    const song = data.songs[0];
+                if (!data || !data.songs || !data.songs.length) throw new Error('song not found');
 
-                    const titleEl = document.getElementById(`${cardUuid}-title`);
-                    const artistEl = document.getElementById(`${cardUuid}-artist`);
-                    const coverEl = document.getElementById(`${cardUuid}-cover`);
+                const song = data.songs[0];
+                const titleEl = document.getElementById(`${cardUuid}-title`);
+                const artistEl = document.getElementById(`${cardUuid}-artist`);
+                const coverEl = document.getElementById(`${cardUuid}-cover`);
 
-                    if (titleEl) titleEl.textContent = song.name || 'Unknown';
-                    if (artistEl) {
-                        const artistName = song.ar ? song.ar.map(function(a) { return a.name; }).join(', ') : 'Unknown Artist';
-                        artistEl.textContent = artistName;
-                    }
-                    if (coverEl && song.al && song.al.picUrl) {
-                        coverEl.style.backgroundImage = 'url(' + song.al.picUrl + ')';
-                        coverEl.style.backgroundColor = 'transparent';
-                    }
-
-                    card.classList.remove('fetch-waiting');
-                    card.dataset.loaded = 'true';
+                if (titleEl) titleEl.textContent = song.name || 'Unknown';
+                if (artistEl) {
+                    const artistName = song.ar ? song.ar.map(function(a) { return a.name; }).join(', ') : 'Unknown Artist';
+                    artistEl.textContent = artistName;
                 }
+                if (coverEl && song.al && song.al.picUrl) {
+                    coverEl.style.backgroundImage = 'url(' + song.al.picUrl + ')';
+                    coverEl.style.backgroundColor = 'transparent';
+                }
+
+                card.classList.remove('fetch-waiting');
+                card.dataset.loaded = 'true';
             })
             .catch(function(err) {
-                card.classList.add('fetch-error');
-                console.warn('[MUSIC-CARD] Error loading ' + songId + ':', err);
+                fail(isFetchTransientError(err) ? '网络请求失败，请稍后重试' : '歌曲信息加载失败', err);
             });
     });
 }
@@ -1307,13 +1518,10 @@ function setTheme(theme) {
     document.documentElement.setAttribute('data-theme', theme);
     currentTheme = theme;
 
-    // 更新代码高亮主题
-    if (hljsTheme) {
-        if (theme === 'dark') {
-            hljsTheme.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
-        } else {
-            hljsTheme.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
-        }
+    // 更新代码高亮主题（两套样式表都已引入，切换 disabled 即可）
+    if (hljsThemeLight && hljsThemeDark) {
+        hljsThemeDark.disabled = theme !== 'dark';
+        hljsThemeLight.disabled = theme === 'dark';
     }
 
     // 更新图标
@@ -1514,45 +1722,87 @@ function handleToolbarAction(action) {
             return;
     }
 
-    // 插入文本
-    editor.focus();
-    editor.setRangeText(replacement, start, end, 'end');
+    // 插入文本（优先走 execCommand，保留浏览器撤销栈；失败时降级 setRangeText）
+    const triggeredInput = replaceEditorRange(start, end, replacement);
+    editor.setSelectionRange(
+        Math.min(selectStart, editor.value.length),
+        Math.min(selectEnd, editor.value.length)
+    );
 
-    // 设置选区
-    if (!selectedText) {
-        editor.setSelectionRange(selectStart, selectEnd);
+    // 降级路径不会触发 input 事件，需要手动刷新
+    if (!triggeredInput) {
+        updatePreview();
+        updateWordCount();
+        scheduleAutoSave();
     }
-
-    // 触发更新
-    updatePreview();
-    updateWordCount();
-    scheduleAutoSave();
 
     console.log('工具栏操作完成');
 }
 
+// ===== 编辑器文本替换（尽量保留撤销栈） =====
+function replaceEditorRange(start, end, text) {
+    editor.focus();
+    editor.setSelectionRange(start, end);
+
+    try {
+        if (document.execCommand('insertText', false, text)) {
+            return true; // execCommand 会自动触发 input 事件
+        }
+    } catch (e) {
+        // 部分环境不支持，走降级方案
+    }
+
+    editor.setRangeText(text, start, end, 'end');
+    return false;
+}
+
 // ===== Tab 键处理 =====
 function handleTabKey(e) {
-    if (e.key === 'Tab') {
-        e.preventDefault();
-        const start = editor.selectionStart;
-        const end = editor.selectionEnd;
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
 
+    const value = editor.value;
+    const start = editor.selectionStart;
+    const end = editor.selectionEnd;
+
+    // 找出选区覆盖的完整行（多行选区时对每一行统一缩进/反缩进）
+    const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+    let lineEnd = value.indexOf('\n', end);
+    if (lineEnd === -1) lineEnd = value.length;
+
+    const lines = value.slice(lineStart, lineEnd).split('\n');
+    const INDENT = '    ';
+    const parts = lines.map(function(line) {
         if (e.shiftKey) {
-            // Shift+Tab: 减少缩进
-            const lineStart = editor.value.lastIndexOf('\n', start - 1) + 1;
-            const currentLine = editor.value.substring(lineStart, end);
-            if (currentLine.startsWith('    ')) {
-                editor.setRangeText('', lineStart, lineStart + 4, 'end');
-            } else if (currentLine.startsWith('\t')) {
-                editor.setRangeText('', lineStart, lineStart + 1, 'end');
-            }
-        } else {
-            // Tab: 增加缩进
-            editor.setRangeText('    ', start, end, 'end');
+            // Shift+Tab：每行去掉一个制表符或最多 4 个空格
+            const match = line.match(/^(\t| {1,4})/);
+            return match ? line.slice(match[0].length) : line;
         }
+        // 空行不缩进，避免累积空白
+        return line.length > 0 ? INDENT + line : line;
+    });
+    const newText = parts.join('\n');
 
+    const triggeredInput = replaceEditorRange(lineStart, lineEnd, newText);
+
+    // 还原选区：累计每行行首的增减量
+    const deltaAt = function(pos) {
+        let offset = lineStart;
+        let delta = 0;
+        for (let i = 0; i < lines.length; i += 1) {
+            if (offset <= pos) delta += parts[i].length - lines[i].length;
+            offset += lines[i].length + 1;
+        }
+        return delta;
+    };
+    editor.setSelectionRange(
+        Math.max(0, start + deltaAt(start)),
+        Math.min(editor.value.length, end + deltaAt(end))
+    );
+
+    if (!triggeredInput) {
         updatePreview();
+        updateWordCount();
         scheduleAutoSave();
     }
 }
